@@ -1,0 +1,2 @@
+# opkg
+Gerenciador de programas 

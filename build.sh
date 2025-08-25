@@ -84,36 +84,67 @@ build() {
 }
 
 install_pkg() {
-    recipe="$1"
-    source "$recipe"
-    cd "$WORK/$PKGDIR"
+    local recipe="$1"
+    declare -A visited
+    _install_recursive() {
+        local r="$1"
+        [ -f "$r" ] || err "Receita não encontrada: $r"
+        source "$r"
 
-    # Limpa instalação anterior
-    rm -rf "$PKG"/*
+        # Evitar ciclos
+        if [ "${visited[$NAME]:-0}" -eq 1 ]; then
+            return
+        fi
+        visited["$NAME"]=1
 
-    fakeroot bash -c "$INSTALL"
+        # Resolver dependências recursivas
+        for dep in ${DEPENDS:-}; do
+            if ! ls "$LOGDB/$dep-"*.files >/dev/null 2>&1; then
+                local dep_recipe="recipes/$dep.recipe"
+                if [ -f "$dep_recipe" ]; then
+                    log "Instalando dependência: $dep"
+                    _install_recursive "$dep_recipe"
+                else
+                    err "Receita da dependência '$dep' não encontrada"
+                fi
+            else
+                log "Dependência $dep já instalada"
+            fi
+        done
 
-    # Reloca binários para /var/bin
-    mkdir -p "$PKG$BIN"
-    if [ -d "$PKG/usr/bin" ]; then
-        mv "$PKG/usr/bin/"* "$PKG$BIN/" 2>/dev/null || true
-        rm -rf "$PKG/usr/bin"
-    fi
+        # Instalar o pacote atual
+        cd "$WORK/$PKGDIR"
+        rm -rf "$PKG"/*
 
-    # Registrar todos os arquivos instalados
-    FILELIST="$LOGDB/$NAME-$VERSION.files"
-    (cd "$PKG"; find . -type f -o -type l) | sed 's|^\./|/|' > "$FILELIST"
+        log "Instalando $NAME..."
+        fakeroot bash -c "$INSTALL"
 
-    # Criar log humano
-    LOGFILE="$LOGDB/$NAME-$VERSION.log"
-    {
-        echo "Pacote: $NAME"
-        echo "Versão: $VERSION"
-        echo "Fonte: $SOURCE"
-        echo "Fontes extras: ${EXTRA_SOURCES:-}"
-        echo "Binários em: $BIN"
-        echo "Arquivos instalados listados em: $FILELIST"
-    } > "$LOGFILE"
+        mkdir -p "$PKG$BIN"
+        if [ -d "$PKG/usr/bin" ]; then
+            mv "$PKG/usr/bin/"* "$PKG$BIN/" 2>/dev/null || true
+            rm -rf "$PKG/usr/bin"
+        fi
+
+        # Registrar arquivos instalados
+        FILELIST="$LOGDB/$NAME-$VERSION.files"
+        (cd "$PKG"; find . -type f -o -type l) | sed 's|^\./|/|' > "$FILELIST"
+
+        # Criar log humano
+        LOGFILE="$LOGDB/$NAME-$VERSION.log"
+        {
+            echo "Pacote: $NAME"
+            echo "Versão: $VERSION"
+            echo "Fonte: $SOURCE"
+            echo "Dependências: ${DEPENDS:-}"
+            echo "Binários em: $BIN"
+            echo "Arquivos instalados: $FILELIST"
+        } > "$LOGFILE"
+
+        # Empacotar
+        package "$r"
+    }
+
+    _install_recursive "$recipe"
 }
 
 package() {

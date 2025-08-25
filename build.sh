@@ -1,11 +1,10 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Diretórios padrão
-WORK="${WORK:-/tmp/work}"          # Área de build
-PKG="${PKG:-/tmp/pkg}"             # Área de instalação (fakeroot)
-SOURCES="${SOURCES:-/tmp/sources}" # Onde ficam os arquivos baixados
-BIN="/var/bin"                     # Binários irão para /var/bin no pacote
+WORK="${WORK:-/tmp/work}"
+PKG="${PKG:-/tmp/pkg}"
+SOURCES="${SOURCES:-/tmp/sources}"
+BIN="/var/bin"
 LOGDB="/var/log/meupkg"
 PKGOUT="${PKGOUT:-/tmp/packages}"
 
@@ -51,19 +50,16 @@ extract() {
     esac
 }
 
-# Função prepare: baixa, extrai e aplica patch
 prepare() {
     recipe="$1"
     source "$recipe"
 
-    # Fonte principal
     fetch "$SOURCE"
     if [ -f "$SOURCES/$(basename $SOURCE)" ]; then
         extract "$(basename $SOURCE)"
     fi
 
-    # Fontes adicionais
-    if [ -n "$EXTRA_SOURCES" ]; then
+    if [ -n "${EXTRA_SOURCES:-}" ]; then
         for src in $EXTRA_SOURCES; do
             fetch "$src"
             if [ -f "$SOURCES/$(basename $src)" ]; then
@@ -72,85 +68,103 @@ prepare() {
         done
     fi
 
-    # Entra no diretório do pacote
     cd "$WORK/$PKGDIR"
-
-    # Aplica patches se houver
-    if [ -n "$PATCHES" ]; then
+    if [ -n "${PATCHES:-}" ]; then
         for p in $PATCHES; do
             patch -p1 < "$p"
         done
     fi
 }
 
-# Função build: compila
 build() {
     recipe="$1"
     source "$recipe"
-
     cd "$WORK/$PKGDIR"
     eval "$BUILD"
 }
 
-# Função install: instala em $PKG
 install_pkg() {
     recipe="$1"
     source "$recipe"
-
     cd "$WORK/$PKGDIR"
+
+    # Limpa instalação anterior
+    rm -rf "$PKG"/*
+
     fakeroot bash -c "$INSTALL"
 
-    # Garantir que os binários fiquem em /var/bin
+    # Reloca binários para /var/bin
     mkdir -p "$PKG$BIN"
     if [ -d "$PKG/usr/bin" ]; then
         mv "$PKG/usr/bin/"* "$PKG$BIN/" 2>/dev/null || true
         rm -rf "$PKG/usr/bin"
     fi
 
-    # Registro da instalação
+    # Registrar todos os arquivos instalados
+    FILELIST="$LOGDB/$NAME-$VERSION.files"
+    (cd "$PKG"; find . -type f -o -type l) | sed 's|^\./|/|' > "$FILELIST"
+
+    # Criar log humano
     LOGFILE="$LOGDB/$NAME-$VERSION.log"
     {
         echo "Pacote: $NAME"
         echo "Versão: $VERSION"
-        echo "Fonte principal: $SOURCE"
-        echo "Fontes baixadas: $SOURCES"
-        echo "Binários instalados em: $BIN"
-        ls "$PKG$BIN" || echo "Nenhum binário encontrado"
+        echo "Fonte: $SOURCE"
+        echo "Fontes extras: ${EXTRA_SOURCES:-}"
+        echo "Binários em: $BIN"
+        echo "Arquivos instalados listados em: $FILELIST"
     } > "$LOGFILE"
 }
 
-# Função package: empacota instalação e gera metadata
 package() {
     recipe="$1"
     source "$recipe"
 
     cd "$PKG"
-
     PKGFILE="$PKGOUT/${NAME}-${VERSION}.tar.xz"
     tar -cJf "$PKGFILE" *
 
-    # Metadados
+    # Gera metadados .meta
     META="$PKGOUT/${NAME}-${VERSION}.meta"
     {
         echo "NAME=$NAME"
         echo "VERSION=$VERSION"
         echo "SOURCE=$SOURCE"
-        echo "EXTRA_SOURCES=$EXTRA_SOURCES"
+        echo "EXTRA_SOURCES=${EXTRA_SOURCES:-}"
+        echo "DEPENDS=${DEPENDS:-}"
         echo "SOURCES_DIR=$SOURCES"
         echo "BIN_DIR=$BIN"
     } > "$META"
 
+    # Gera package.json
+    FILELIST="$LOGDB/$NAME-$VERSION.files"
+    JSON="$PKGOUT/${NAME}-${VERSION}.json"
+    {
+        echo "{"
+        echo "  \"name\": \"$NAME\","
+        echo "  \"version\": \"$VERSION\","
+        echo "  \"source\": \"$SOURCE\","
+        echo "  \"extra_sources\": [$(for s in ${EXTRA_SOURCES:-}; do echo -n "\"$s\","; done | sed 's/,$//')],"
+        echo "  \"depends\": [$(for d in ${DEPENDS:-}; do echo -n "\"$d\","; done | sed 's/,$//')],"
+        echo "  \"bin_dir\": \"$BIN\","
+        echo "  \"sources_dir\": \"$SOURCES\","
+        echo "  \"files\": ["
+        if [ -f "$FILELIST" ]; then
+            awk '{print "    \""$0"\","}' "$FILELIST" | sed '$ s/,$//'
+        fi
+        echo "  ]"
+        echo "}"
+    } > "$JSON"
+
     echo "Pacote gerado: $PKGFILE"
-    echo "Metadados: $META"
+    echo "Meta: $META"
+    echo "JSON: $JSON"
 }
 
-# Execução principal
 case "$1" in
     prepare) prepare "$2" ;;
     build) build "$2" ;;
     install) install_pkg "$2" ;;
     package) package "$2" ;;
-    *)
-        echo "Uso: $0 {prepare|build|install|package} receita"
-        ;;
+    *) echo "Uso: $0 {prepare|build|install|package} receita" ;;
 esac

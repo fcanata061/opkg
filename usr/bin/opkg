@@ -1,0 +1,465 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/opkg.conf"
+[ -f "$CONFIG_FILE" ] || { echo "Configuração não encontrada em $CONFIG_FILE"; exit 1; }
+source "$CONFIG_FILE"
+
+mkdir -p "$WORK" "$PKG" "$BIN" "$SOURCES" "$PKGOUT" "$LOGDB"
+
+# ---------- Cores ----------
+C_RESET="\033[0m"
+C_RED="\033[31m"
+C_GREEN="\033[32m"
+C_BLUE="\033[34m"
+C_YELLOW="\033[33m"
+
+log() { echo -e "${C_BLUE}[opkg]${C_RESET} $*"; }
+warn() { echo -e "${C_YELLOW}[aviso]${C_RESET} $*"; }
+err() { echo -e "${C_RED}[erro]${C_RESET} $*" >&2; exit 1; }
+
+# ---------- Spinner ----------
+spinner() {
+    local pid=$!
+    local spin="$SPINNER_CHARS"
+    while kill -0 $pid 2>/dev/null; do
+        for i in {0..3}; do
+            echo -ne "\r${C_GREEN}[...]"${C_RESET}" ${spin:$i:1}"
+            sleep 0.1
+        done
+    done
+    echo -ne "\r"
+}
+# ---------- Funções de build e preparação ----------
+
+fetch() {
+    local url="$1"
+    cd "$SOURCES"
+    case "$url" in
+        *.git)
+            git clone "$url" "$WORK/$(basename "$url" .git)" &
+            spinner
+            ;;
+        http*://*)
+            if command -v curl >/dev/null; then
+                curl -L -O "$url" &
+            else
+                wget "$url" &
+            fi
+            spinner
+            ;;
+        *)
+            err "URL não suportada: $url"
+            ;;
+    esac
+}
+
+extract() {
+    local file="$1"
+    cd "$WORK"
+    case "$file" in
+        *.tar.gz|*.tgz) tar xvf "$SOURCES/$file" ;;
+        *.tar.bz2) tar xvjf "$SOURCES/$file" ;;
+        *.tar.xz) tar xvf "$SOURCES/$file" ;;
+        *.zip) unzip "$SOURCES/$file" ;;
+        *.gz) gunzip -c "$SOURCES/$file" > "${file%.gz}" ;;
+        *.bz2) bunzip2 -c "$SOURCES/$file" > "${file%.bz2}" ;;
+        *.xz) unxz -c "$SOURCES/$file" > "${file%.xz}" ;;
+        *) warn "Formato não suportado: $file" ;;
+    esac
+}
+
+prepare() {
+    local recipe="$1"
+    source "$recipe"
+
+    log "Fetching sources for $NAME..."
+    fetch "$SOURCE"
+
+    if [ -f "$SOURCES/$(basename $SOURCE)" ]; then
+        extract "$(basename $SOURCE)"
+    fi
+
+    if [ -n "${EXTRA_SOURCES:-}" ]; then
+        for src in $EXTRA_SOURCES; do
+            fetch "$src"
+            if [ -f "$SOURCES/$(basename $src)" ]; then
+                extract "$(basename $src)"
+            fi
+        done
+    fi
+
+    cd "$WORK/$PKGDIR"
+    if [ -n "${PATCHES:-}" ]; then
+        for p in $PATCHES; do
+            patch -p1 < "$p"
+        done
+    fi
+}
+
+build() {
+    local recipe="$1"
+    source "$recipe"
+    cd "$WORK/$PKGDIR"
+    log "Executando build: $BUILD"
+    eval "$BUILD"
+}
+
+install_pkg() {
+    local recipe="$1"
+    source "$recipe"
+    cd "$WORK/$PKGDIR"
+
+    rm -rf "$PKG"/*
+
+    log "Executando instalação..."
+    fakeroot bash -c "$INSTALL"
+
+    mkdir -p "$PKG$BIN"
+    if [ -d "$PKG/usr/bin" ]; then
+        mv "$PKG/usr/bin/"* "$PKG$BIN/" 2>/dev/null || true
+        rm -rf "$PKG/usr/bin"
+    fi
+
+    # Registrar arquivos instalados
+    FILELIST="$LOGDB/$NAME-$VERSION.files"
+    (cd "$PKG"; find . -type f -o -type l) | sed 's|^\./|/|' > "$FILELIST"
+
+    # Criar log humano
+    LOGFILE="$LOGDB/$NAME-$VERSION.log"
+    {
+        echo "Pacote: $NAME"
+        echo "Versão: $VERSION"
+        echo "Fonte: $SOURCE"
+        echo "Fontes extras: ${EXTRA_SOURCES:-}"
+        echo "Binários em: $BIN"
+        echo "Arquivos instalados: $FILELIST"
+    } > "$LOGFILE"
+}
+
+package() {
+    local recipe="$1"
+    source "$recipe"
+
+    cd "$PKG"
+    PKGFILE="$PKGOUT/${NAME}-${VERSION}.tar.xz"
+    tar -cJf "$PKGFILE" *
+
+    # Meta
+    META="$PKGOUT/${NAME}-${VERSION}.meta"
+    {
+        echo "NAME=$NAME"
+        echo "VERSION=$VERSION"
+        echo "SOURCE=$SOURCE"
+        echo "EXTRA_SOURCES=${EXTRA_SOURCES:-}"
+        echo "DEPENDS=${DEPENDS:-}"
+        echo "SOURCES_DIR=$SOURCES"
+        echo "BIN_DIR=$BIN"
+    } > "$META"
+
+    # JSON
+    JSON="$PKGOUT/${NAME}-${VERSION}.json"
+    {
+        echo "{"
+        echo "  \"name\": \"$NAME\","
+        echo "  \"version\": \"$VERSION\","
+        echo "  \"source\": \"$SOURCE\","
+        echo "  \"extra_sources\": [$(for s in ${EXTRA_SOURCES:-}; do echo -n "\"$s\","; done | sed 's/,$//')],"
+        echo "  \"depends\": [$(for d in ${DEPENDS:-}; do echo -n "\"$d\","; done | sed 's/,$//')],"
+        echo "  \"bin_dir\": \"$BIN\","
+        echo "  \"sources_dir\": \"$SOURCES\","
+        echo "  \"files\": ["
+        if [ -f "$FILELIST" ]; then
+            awk '{print "    \""$0"\","}' "$FILELIST" | sed '$ s/,$//'
+        fi
+        echo "  ]"
+        echo "}"
+    } > "$JSON"
+
+    log "Pacote gerado: $PKGFILE"
+}
+# ---------- Remoção precisa ----------
+remove_pkg() {
+    local name="$1"
+    local force="${2:-0}"
+
+    local files_log="$LOGDB/$name-"*.files
+    for f in $files_log; do
+        [ -f "$f" ] || continue
+        while read -r path; do
+            local abs="$PKG$path"
+            if [ -e "$abs" ]; then
+                rm -f "$abs"
+                log "Removido $abs"
+            fi
+        done < "$f"
+        rm -f "$f"
+    done
+
+    rm -f "$LOGDB/$name-"*.log
+    rm -f "$PKGOUT/$name-"*.{meta,json,tar.xz}
+
+    log "Pacote $name removido."
+}
+
+# ---------- Search ----------
+search_pkg() {
+    local query="$1"
+    local found=0
+    for f in "$PKGOUT"/*.json; do
+        [ -f "$f" ] || continue
+        if grep -iq "$query" "$f"; then
+            local name=$(jq -r .name "$f")
+            local ver=$(jq -r .version "$f")
+            if [ -f "$LOGDB/$name-"*.files ] ; then
+                echo -e "${C_GREEN}$name $ver [INSTALADO]${C_RESET}"
+            else
+                echo -e "${C_YELLOW}$name $ver${C_RESET}"
+            fi
+            found=1
+        fi
+    done
+    [ $found -eq 0 ] && warn "Nenhum pacote encontrado para '$query'"
+}
+
+# ---------- Info ----------
+info_pkg() {
+    local name="$1"
+    local json="$PKGOUT/$name-"*.json
+    [ -f $json ] || err "Metadados não encontrados para $name"
+    jq . "$json"
+}
+
+# ---------- Strip ----------
+strip_bins() {
+    if [ "${STRIP:-1}" -eq 1 ]; then
+        log "Striping binários..."
+        find "$BIN" -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
+    else
+        warn "Strip desabilitado em $CONFIG_FILE"
+    fi
+}
+
+# ---------- SHA256 ----------
+sha256_pkg() {
+    local pkgfile="$1"
+    [ -f "$pkgfile" ] || err "Arquivo não encontrado: $pkgfile"
+    sha256sum "$pkgfile" | tee "$pkgfile.sha256"
+}
+
+verify_sha256() {
+    local pkgfile="$1"
+    [ -f "$pkgfile" ] || err "Arquivo não encontrado: $pkgfile"
+    sha256sum -c "$pkgfile.sha256"
+}
+
+# ---------- Remover órfãos ----------
+remove_orphans() {
+    log "Removendo pacotes órfãos..."
+    for pkg in $(ls "$LOGDB"/*.json 2>/dev/null | sed 's#.*/##;s/\.json//'); do
+        local deps=$(jq -r '.depends[]?' "$LOGDB/$pkg.json")
+        for d in $deps; do
+            [ -f "$LOGDB/$d-"*.files ] || {
+                warn "Órfão detectado: $pkg (dependia de $d)"
+                remove_pkg "$pkg"
+            }
+        done
+    done
+}
+
+# ---------- Upgrade ----------
+upgrade_pkg() {
+    local recipe="$1"
+    source "$recipe"
+    log "Atualizando $NAME -> $VERSION"
+    remove_pkg "$NAME" "$FORCE"
+    prepare "$recipe" &
+    spinner
+    build "$recipe" &
+    spinner
+    install_pkg "$recipe" &
+    spinner
+    package "$recipe"
+}
+
+# ---------- Sync Git/HTTPS/Token ----------
+sync_repo() {
+    local repo="$1"
+    local dir="$2"
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "$tmpdir"' RETURN
+
+    # Injeção de token se necessário
+    if [[ "$repo" =~ ^https:// && -n "${GIT_TOKEN:-}" ]]; then
+        repo=$(echo "$repo" | sed -E "s#https://#https://oauth2:${GIT_TOKEN}@#")
+    elif [[ "$repo" =~ ^https:// && -n "${GIT_USER:-}" && -n "${GIT_PASS:-}" ]]; then
+        repo=$(echo "$repo" | sed -E "s#https://#https://${GIT_USER}:${GIT_PASS}@#")
+    fi
+
+    git clone --depth 1 "$repo" "$tmpdir"
+    mkdir -p "$tmpdir/$dir"
+    rsync -a --delete "$PKGOUT"/ "$tmpdir/$dir/"
+
+    pushd "$tmpdir" >/dev/null
+    git add -A "$dir"
+    if git diff --quiet --cached; then
+        log "Nada novo para commitar."
+    else
+        git commit -m "Sync packages: $(date --iso-8601=seconds)"
+        git push
+    fi
+    popd >/dev/null
+    log "Sync concluído."
+}
+
+# ---------- Rebuild com topological sort ----------
+resolve_order() {
+    declare -A edges visited temp result
+    local recipes=("$@")
+
+    for r in "${recipes[@]}"; do
+        [ -f "$r" ] || continue
+        source "$r"
+        local pkg="$NAME"
+        for dep in ${DEPENDS:-}; do
+            edges["$dep"]+="$pkg "
+        done
+    done
+
+    topo_visit() {
+        local node="$1"
+        [ "${temp[$node]:-}" == 1 ] && err "Dependência circular detectada em $node"
+        [ "${visited[$node]:-}" == 1 ] && return
+        temp["$node"]=1
+        for dep in ${edges[$node]:-}; do
+            topo_visit "$dep"
+        done
+        temp["$node"]=0
+        visited["$node"]=1
+        result+=("$node")
+    }
+
+    for r in "${recipes[@]}"; do
+        source "$r"
+        topo_visit "$NAME"
+    done
+
+    echo "${result[@]}"
+}
+
+rebuild_world() {
+    log "Recompilando todo o sistema na ordem de dependências..."
+    local recipes=($(ls recipes/*.recipe))
+    local order=($(resolve_order "${recipes[@]}"))
+
+    log "Ordem de compilação: ${order[*]}"
+    for pkg in "${order[@]}"; do
+        local recipe="recipes/$pkg.recipe"
+        if [ -f "$recipe" ]; then
+            log "Recompilando $pkg"
+            upgrade_pkg "$recipe"
+        else
+            warn "Receita não encontrada para $pkg, pulando"
+        fi
+    done
+}
+# ---------- Dispatcher / CLI ----------
+case "${1:-}" in
+    build)
+        shift
+        [ -z "${1:-}" ] && err "Informe a receita"
+        prepare "$1"
+        build "$1"
+        install_pkg "$1"
+        package "$1"
+        ;;
+    install)
+        shift
+        [ -z "${1:-}" ] && err "Informe a receita"
+        prepare "$1"
+        build "$1"
+        install_pkg "$1"
+        package "$1"
+        ;;
+    remove)
+        shift
+        [ -z "${1:-}" ] && err "Informe o nome do pacote"
+        remove_pkg "$1" "$FORCE"
+        ;;
+    upgrade)
+        shift
+        [ -z "${1:-}" ] && err "Informe a receita"
+        upgrade_pkg "$1"
+        ;;
+    rebuild)
+        rebuild_world
+        ;;
+    search)
+        shift
+        [ -z "${1:-}" ] && err "Informe o pacote para buscar"
+        search_pkg "$1"
+        ;;
+    info)
+        shift
+        [ -z "${1:-}" ] && err "Informe o pacote"
+        info_pkg "$1"
+        ;;
+    strip)
+        strip_bins
+        ;;
+    sha256sum)
+        shift
+        [ -z "${1:-}" ] && err "Informe o arquivo"
+        sha256_pkg "$1"
+        ;;
+    verify)
+        shift
+        [ -z "${1:-}" ] && err "Informe o arquivo"
+        verify_sha256 "$1"
+        ;;
+    orphans)
+        remove_orphans
+        ;;
+    sync)
+        shift
+        [ -z "${1:-}" ] && err "Informe o repositório"
+        [ -z "${2:-}" ] && err "Informe o diretório dentro do repo"
+        sync_repo "$1" "$2"
+        ;;
+    help|-h|--help)
+        cat <<EOF
+${C_GREEN}opkg - Gerenciador de Pacotes Minimalista${C_RESET}
+
+Uso:
+  $0 <comando> [opções]
+
+Comandos:
+  build <receita>       Prepara, compila, instala e empacota o pacote
+  install <receita>     Igual a build
+  remove <pacote>       Remove pacote instalado (preciso)
+  upgrade <receita>     Atualiza pacote para nova versão
+  rebuild               Recompila todo o sistema na ordem correta de dependências
+  search <pacote>       Busca programa no repositório local
+  info <pacote>         Mostra informações detalhadas do pacote
+  strip                 Executa strip em todos os binários (se habilitado)
+  sha256sum <arquivo>   Gera SHA256 de pacote
+  verify <arquivo>      Verifica SHA256 de pacote
+  orphans               Remove pacotes órfãos
+  sync <repo> <dir>     Sincroniza repositório Git (HTTPS/token)
+  help                  Mostra esta ajuda
+
+Configuração: $CONFIG_FILE
+Diretórios usados:
+  WORK=$WORK
+  PKG=$PKG
+  BIN=$BIN
+  SOURCES=$SOURCES
+  PKGOUT=$PKGOUT
+  LOGDB=$LOGDB
+EOF
+        ;;
+    *)
+        err "Comando inválido. Use '$0 help'"
+        ;;
+esac

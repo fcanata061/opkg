@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+# ==================================================
+# OPKG - Gerenciador de Pacotes Minimalista
+# Bloco 1: Cabeçalho, cores, utilitários, config
+# ==================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# -----------------------
+# Cores e formatação
+# -----------------------
+RED="\033[0;31m"
+GREEN="\033[0;32m"
+YELLOW="\033[1;33m"
+BLUE="\033[0;34m"
+MAGENTA="\033[0;35m"
+CYAN="\033[0;36m"
+BOLD="\033[1m"
+RESET="\033[0m"
+
+# -----------------------
+# Funções utilitárias
+# -----------------------
+log()   { echo -e "${GREEN}[INFO]${RESET} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${RESET} $*" >&2; }
+err()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
+
+# Spinner de progresso
+spinner() {
+    local pid=$!
+    local delay=0.1
+    local spinstr='|/-\'
+    while ps -p $pid >/dev/null 2>&1; do
+        for i in $(seq 0 3); do
+            printf "\r[%c] $*" "${spinstr:$i:1}"
+            sleep $delay
+        done
+    done
+    printf "\r[✔] $*\n"
+}
+
+# -----------------------
+# Arquivo de configuração
+# -----------------------
+CONFIG_FILE="/etc/opkg.conf"
+[ -f "$CONFIG_FILE" ] || err "Arquivo de configuração não encontrado: $CONFIG_FILE"
+source "$CONFIG_FILE"
+
+# -----------------------
+# Variáveis globais
+# -----------------------
+# Diretórios principais
+WORK="${WORK:-/var/opkg/work}"    # diretório temporário para build
+PKG="${PKG:-/var/opkg/pkg}"      # diretório de pacotes binários
+BIN="${BIN:-/var/bin}"           # diretório onde binários finais vão
+SRC="${SRC:-/var/opkg/src}"      # diretório de fontes
+LOGDB="${LOGDB:-/var/opkg/log}"  # logs e arquivos instalados
+TOOLS="${TOOLS:-/mnt/lfs/tools}" # prefixo toolchain opcional
+
+# Flags globais
+FORCE="${FORCE:-0}"              # sobrescrever arquivos em conflito
+STRIP_BINARIES="${STRIP_BINARIES:-1}" # habilitar strip após build
+# ==================================================
+# OPKG - Bloco 2: Fetch, Extract, Prepare, Install
+# ==================================================
+
+# -----------------------
+# Função fetch (download de fontes)
+# -----------------------
+fetch() {
+    local url="$1"
+    local filename
+    filename="$(basename "$url")"
+    mkdir -p "$SRC"
+    cd "$SRC"
+    if [[ "$url" =~ ^git@|^https?://.*\.git$ ]]; then
+        local repo_dir="${filename%.git}"
+        if [ -d "$repo_dir/.git" ]; then
+            log "Atualizando repositório git: $repo_dir"
+            git -C "$repo_dir" pull
+        else
+            log "Clonando repositório git: $filename"
+            git clone "$url"
+        fi
+    else
+        if [ -f "$filename" ]; then
+            log "Arquivo já existe: $filename"
+        else
+            log "Baixando $filename..."
+            if command -v curl >/dev/null 2>&1; then
+                curl -L -O "$url"
+            elif command -v wget >/dev/null 2>&1; then
+                wget "$url"
+            else
+                err "Nem curl nem wget disponíveis"
+            fi
+        fi
+    fi
+}
+
+# -----------------------
+# Função extract (suporte a tar.gz, tar.xz, zip)
+# -----------------------
+extract() {
+    local file="$1"
+    mkdir -p "$WORK"
+    case "$file" in
+        *.tar.gz|*.tgz)  tar -xzf "$SRC/$file" -C "$WORK" ;;
+        *.tar.xz)        tar -xJf "$SRC/$file" -C "$WORK" ;;
+        *.tar.bz2)       tar -xjf "$SRC/$file" -C "$WORK" ;;
+        *.zip)           unzip -q "$SRC/$file" -d "$WORK" ;;
+        *)               err "Formato não suportado: $file" ;;
+    esac
+}
+
+# -----------------------
+# Função run_hooks
+# -----------------------
+run_hooks() {
+    local stage="$1"   # pre-install, post-install, pre-remove, post-remove
+    local name="$2"
+    local version="$3"
+    local recipe="$4"
+    local dir="/etc/opkg/hooks/$stage"
+    [ -d "$dir" ] || return 0
+    for hook in "$dir"/*; do
+        [ -x "$hook" ] && "$hook" "$name" "$version" "$recipe"
+    done
+}
+
+# -----------------------
+# Função log centralizada
+# -----------------------
+log_action() {
+    local action="$1"
+    local name="$2"
+    local version="$3"
+    local extra="${4:-}"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "[$ts] $action $name-$version $extra" >> /var/log/opkg.log
+}
+
+# -----------------------
+# Função prepare
+# -----------------------
+prepare() {
+    local recipe="$1"
+    [ -f "$recipe" ] || err "Receita não encontrada: $recipe"
+    source "$recipe"
+
+    log "Preparando $NAME-$VERSION..."
+
+    # baixar fontes principais
+    fetch "$SOURCE"
+    extract "$(basename $SOURCE)"
+
+    # baixar fontes extras
+    if [ -n "${EXTRA_SOURCES:-}" ]; then
+        for src in $EXTRA_SOURCES; do
+            fetch "$src"
+            extract "$(basename $src)"
+        done
+    fi
+
+    # aplicar patches
+    if [ -n "${PATCHES:-}" ]; then
+        log "Aplicando patches..."
+        cd "$WORK/$PKGDIR"
+        for p in $PATCHES; do
+            if [ -f "$p" ]; then
+                patch -p1 < "$p"
+                log "Patch aplicado: $p"
+            else
+                warn "Patch não encontrado: $p"
+            fi
+        done
+    fi
+}
+
+# -----------------------
+# Função install_pkg (resolução de deps, toolchain, hooks)
+# -----------------------
+install_pkg() {
+    local recipe="$1"
+    declare -A visited
+    _install_recursive() {
+        local r="$1"
+        [ -f "$r" ] || err "Receita não encontrada: $r"
+        source "$r"
+
+        # Evitar ciclos
+        if [ "${visited[$NAME]:-0}" -eq 1 ]; then
+            return
+        fi
+        visited["$NAME"]=1
+
+        # Resolver dependências recursivas
+        for dep in ${DEPENDS:-}; do
+            if ! ls "$LOGDB/$dep-"*.files >/dev/null 2>&1; then
+                local dep_recipe="recipes/$dep.recipe"
+                if [ -f "$dep_recipe" ]; then
+                    log "Instalando dependência: $dep"
+                    _install_recursive "$dep_recipe"
+                else
+                    err "Receita da dependência '$dep' não encontrada"
+                fi
+            else
+                log "Dependência $dep já instalada"
+            fi
+        done
+
+        # Hooks pre-install
+        run_hooks pre-install "$NAME" "$VERSION" "$r"
+
+        # Diretório de build
+        cd "$WORK/$PKGDIR"
+        rm -rf "$PKG"/*
+
+        log "Construindo e instalando $NAME-$VERSION..."
+        # Configurar toolchain/prefix
+        local PREFIX_PATH="${PREFIX:-$BIN}"
+        if [ "${TOOLCHAIN:-0}" -eq 1 ]; then
+            PREFIX_PATH="${TOOLS}"
+        fi
+        export PATH="$PREFIX_PATH/bin:$PATH"
+        # Build/Install
+        fakeroot bash -c "$BUILD"
+        fakeroot bash -c "$INSTALL"
+
+        # Mover binários para $BIN
+        mkdir -p "$PKG$BIN"
+        if [ -d "$PKG/usr/bin" ]; then
+            mv "$PKG/usr/bin/"* "$PKG$BIN/" 2>/dev/null || true
+            rm -rf "$PKG/usr/bin"
+        fi
+
+        # Registrar arquivos instalados
+        FILELIST="$LOGDB/$NAME-$VERSION.files"
+        (cd "$PKG"; find . -type f -o -type l) | sed 's|^\./|/|' > "$FILELIST"
+
+        # Log humano
+        LOGFILE="$LOGDB/$NAME-$VERSION.log"
+        {
+            echo "Pacote: $NAME"
+            echo "Versão: $VERSION"
+            echo "Fonte: $SOURCE"
+            echo "Dependências: ${DEPENDS:-}"
+            echo "Binários em: $BIN"
+            echo "Arquivos instalados: $FILELIST"
+        } > "$LOGFILE"
+
+        # Hooks post-install
+        run_hooks post-install "$NAME" "$VERSION" "$r"
+        log_action INSTALL "$NAME" "$VERSION" "deps: ${DEPENDS:-}"
+    }
+    _install_recursive "$recipe"
+}
+# ==================================================
+# OPKG - Bloco 3: Remove, Upgrade, Search, Info, Strip, SHA256, Orphans, Sync
+# ==================================================
+
+# -----------------------
+# Função remove_pkg
+# -----------------------
+remove_pkg() {
+    local name="$1"
+    local version
+    # Tenta descobrir versão pelo log
+    version=$(ls "$LOGDB/$name-"*.files 2>/dev/null | xargs -n1 basename | sed 's/^'"$name"'-//; s/\.files$//')
+    [ -z "$version" ] && err "Pacote não instalado: $name"
+
+    run_hooks pre-remove "$name" "$version"
+
+    local filelist="$LOGDB/$name-$version.files"
+    if [ ! -f "$filelist" ]; then
+        err "Lista de arquivos não encontrada para $name-$version"
+    fi
+
+    while IFS= read -r f; do
+        [ "$FORCE" -eq 1 ] || [ -e "$f" ] || continue
+        rm -f "$f" 2>/dev/null || warn "Não foi possível remover $f"
+    done < "$filelist"
+
+    rm -f "$filelist" "$LOGDB/$name-$version.log"
+
+    run_hooks post-remove "$name" "$version"
+    log_action REMOVE "$name" "$version"
+    log "Pacote $name-$version removido com sucesso"
+}
+
+# -----------------------
+# Função upgrade_pkg
+# -----------------------
+upgrade_pkg() {
+    local recipe="$1"
+    [ -f "$recipe" ] || err "Receita não encontrada: $recipe"
+    source "$recipe"
+    log "Atualizando $NAME-$VERSION..."
+    run_hooks pre-upgrade "$NAME" "$VERSION" "$recipe"
+    # remove antigo
+    remove_pkg "$NAME"
+    # instala novo
+    install_pkg "$recipe"
+    run_hooks post-upgrade "$NAME" "$VERSION" "$recipe"
+    log_action UPGRADE "$NAME" "$VERSION"
+}
+
+# -----------------------
+# Função search
+# -----------------------
+search_pkg() {
+    local term="$1"
+    local installed=0
+    grep -i "$term" "$LOGDB/"*.files >/dev/null 2>&1 && installed=1
+    echo -e "${CYAN}Resultados da busca para '$term':${RESET}"
+    for f in recipes/*.recipe; do
+        local pkg
+        pkg=$(basename "$f" .recipe)
+        if [[ "$pkg" =~ $term ]]; then
+            if [ $installed -eq 1 ] && ls "$LOGDB/$pkg-"* >/dev/null 2>&1; then
+                echo -e "${GREEN}$pkg (INSTALADO)${RESET}"
+            else
+                echo -e "$pkg"
+            fi
+        fi
+    done
+}
+
+# -----------------------
+# Função info
+# -----------------------
+info_pkg() {
+    local name="$1"
+    local logf
+    logf=$(ls "$LOGDB/$name-"*.log 2>/dev/null | head -n1)
+    [ -f "$logf" ] || err "Informações não encontradas para $name"
+    cat "$logf"
+}
+
+# -----------------------
+# Função strip_pkg
+# -----------------------
+strip_pkg() {
+    local pkg="$1"
+    [ "${STRIP_BINARIES:-1}" -eq 0 ] && return
+    find "$PKG$BIN" -type f -executable -exec strip --strip-unneeded {} \; 2>/dev/null
+}
+
+# -----------------------
+# Função sha256sum_pkg
+# -----------------------
+sha256sum_pkg() {
+    local pkg="$1"
+    sha256sum "$PKG/$pkg-"*.tar.xz 2>/dev/null || warn "Pacote não encontrado: $pkg"
+}
+
+# -----------------------
+# Função criar sha256sum do pacote atual
+# -----------------------
+sha256sum_create() {
+    local pkg="$1"
+    cd "$PKG" && sha256sum "$pkg-"*.tar.xz > "$pkg-"*.tar.xz.sha256
+}
+
+# -----------------------
+# Função remover órfãos
+# -----------------------
+remove_orphans() {
+    local all_installed
+    all_installed=$(ls "$LOGDB/"*.files | xargs -n1 basename | sed 's/\.files$//')
+    for pkg in $all_installed; do
+        source "recipes/$pkg.recipe" 2>/dev/null || continue
+        for dep in ${DEPENDS:-}; do
+            if ! echo "$all_installed" | grep -qw "$dep"; then
+                warn "Pacote órfão detectado: $dep"
+                remove_pkg "$dep"
+            fi
+        done
+    done
+}
+
+# -----------------------
+# Função sync (Git remoto)
+# -----------------------
+sync_repo() {
+    local repo="${1:-}"
+    [ -z "$repo" ] && repo="$REPO_URL"
+    [ -z "$repo" ] && err "URL do repositório Git não definido"
+    log "Sincronizando repositório $repo"
+    git -C . pull "$repo" || git clone "$repo"
+}
+
+# -----------------------
+# Função rebuild (topological sort)
+# -----------------------
+rebuild_all() {
+    # Construção mínima: instalar pacotes sem dependências primeiro
+    local installed=()
+    local sorted=()
+    for r in recipes/*.recipe; do
+        source "$r"
+        installed+=("$NAME")
+    done
+
+    topo_sort() {
+        local visited=()
+        local result=()
+        _visit() {
+            local pkg="$1"
+            [[ " ${visited[*]} " =~ " $pkg " ]] && return
+            visited+=("$pkg")
+            local r="recipes/$pkg.recipe"
+            source "$r"
+            for dep in ${DEPENDS:-}; do
+                _visit "$dep"
+            done
+            result+=("$pkg")
+        }
+        for pkg in "${installed[@]}"; do
+            _visit "$pkg"
+        done
+        echo "${result[@]}"
+    }
+
+    local order
+    order=$(topo_sort)
+    for pkg in $order; do
+        install_pkg "recipes/$pkg.recipe"
+    done
+}
+# ==================================================
+# OPKG - Bloco 4: Dispatcher CLI
+# ==================================================
+
+show_help() {
+    cat <<EOF
+${BOLD}OPKG - Gerenciador de Pacotes Minimalista${RESET}
+
+Uso: opkg <comando> [opções]
+
+Comandos:
+  install <pacote|receita>   Instala pacote (resolve dependências)
+  remove <pacote>            Remove pacote
+  upgrade <pacote|receita>   Atualiza pacote
+  search <termo>             Busca pacotes
+  info <pacote>              Mostra informações do pacote
+  rebuild                    Recompila todos os pacotes na ordem correta
+  sync [repo]                Sincroniza repositório Git remoto
+  orphans                    Remove pacotes órfãos
+  sha256 <pacote>            Mostra sha256sum do pacote
+  help                       Mostra este menu
+
+Opções globais:
+  --force                    Sobrescrever arquivos em conflito
+EOF
+}
+
+# -----------------------
+# Processamento de flags globais
+# -----------------------
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --force)
+            FORCE=1
+            shift
+            ;;
+        *)
+            warn "Opção desconhecida: $1"
+            shift
+            ;;
+    esac
+done
+
+# -----------------------
+# Dispatcher principal
+# -----------------------
+case "${1:-}" in
+    install)
+        shift
+        [ -z "${1:-}" ] && { show_help; exit 1; }
+        target="$1"
+        # Detecta se é receita ou nome curto
+        if [ -f "$target" ]; then
+            recipe="$target"
+        elif [ -f "recipes/$target.recipe" ]; then
+            recipe="recipes/$target.recipe"
+        else
+            err "Receita não encontrada: $target"
+        fi
+        install_pkg "$recipe"
+        ;;
+
+    remove)
+        shift
+        [ -z "${1:-}" ] && { show_help; exit 1; }
+        remove_pkg "$1"
+        ;;
+
+    upgrade)
+        shift
+        [ -z "${1:-}" ] && { show_help; exit 1; }
+        target="$1"
+        if [ -f "$target" ]; then
+            recipe="$target"
+        elif [ -f "recipes/$target.recipe" ]; then
+            recipe="recipes/$target.recipe"
+        else
+            err "Receita não encontrada: $target"
+        fi
+        upgrade_pkg "$recipe"
+        ;;
+
+    search)
+        shift
+        [ -z "${1:-}" ] && { show_help; exit 1; }
+        search_pkg "$1"
+        ;;
+
+    info)
+        shift
+        [ -z "${1:-}" ] && { show_help; exit 1; }
+        info_pkg "$1"
+        ;;
+
+    rebuild)
+        rebuild_all
+        ;;
+
+    sync)
+        shift
+        sync_repo "${1:-}"
+        ;;
+
+    orphans)
+        remove_orphans
+        ;;
+
+    sha256)
+        shift
+        [ -z "${1:-}" ] && { show_help; exit 1; }
+        sha256sum_pkg "$1"
+        ;;
+
+    help|--help|-h)
+        show_help
+        ;;
+
+    *)
+        err "Comando desconhecido: ${1:-}"
+        ;;
+esac

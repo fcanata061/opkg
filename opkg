@@ -1,0 +1,122 @@
+#!/bin/bash
+set -euo pipefail
+
+BASE_DIR="$(dirname "$(realpath "$0")")"
+BUILDER="$BASE_DIR/builder.sh"
+MANAGER="$BASE_DIR/manager.sh"
+
+LOGDB="/var/log/meupkg"
+PKGOUT="/tmp/packages"
+
+mkdir -p "$LOGDB" "$PKGOUT"
+
+log() {
+    echo "[pkg] $*"
+}
+
+help() {
+    cat <<EOF
+Gerenciador de pacotes simples
+
+Uso:
+  $0 <comando> [opções]
+
+Comandos principais:
+  build <receita>     Prepara, compila, instala e empacota o programa
+  remove <nome>       Remove um pacote instalado e limpa registros
+  upgrade <receita>   Remove versão anterior e recompila a nova
+  deps <receita>      Resolve dependências da receita (recursivo no futuro)
+  sync <repo> <dir>   Sincroniza repositório Git (HTTPS/token suportado)
+  list                Lista pacotes instalados
+  info <nome>         Mostra metadados detalhados (.json) do pacote
+  help                Mostra esta ajuda
+
+Exemplos:
+  $0 build recipes/hello.recipe
+  $0 remove hello
+  $0 list
+  $0 info hello
+  GIT_TOKEN=seutoken $0 sync https://gitserver.com/meu-repo.git pkgs
+
+Diretórios usados:
+  Fontes baixadas:     /tmp/sources
+  Área de build:       /tmp/work
+  Área de instalação:  /tmp/pkg
+  Pacotes gerados:     /tmp/packages
+  Binários finais:     /var/bin
+  Banco de dados:      /var/log/meupkg
+
+EOF
+}
+
+cmd_build() {
+    local recipe="$1"
+    log "Preparando $recipe"
+    "$BUILDER" prepare "$recipe"
+    log "Compilando $recipe"
+    "$BUILDER" build "$recipe"
+    log "Instalando $recipe"
+    "$BUILDER" install "$recipe"
+    log "Empacotando $recipe"
+    "$BUILDER" package "$recipe"
+}
+
+cmd_remove() {
+    local name="$1"
+    "$MANAGER" remove_pkg "$name"
+}
+
+cmd_sync() {
+    local repo="$1"
+    local dir="$2"
+    "$MANAGER" sync_repo "$repo" "$dir"
+}
+
+cmd_list() {
+    ls "$LOGDB"/*.log 2>/dev/null | sed 's#.*/##;s/\.log//' || true
+}
+
+cmd_info() {
+    local name="$1"
+    local json="$PKGOUT/$name-"*.json
+    if ls $json >/dev/null 2>&1; then
+        cat $json | jq .
+    else
+        log "Metadados não encontrados para $name"
+    fi
+}
+
+cmd_upgrade() {
+    local recipe="$1"
+    source "$recipe"
+    log "Removendo versão anterior de $NAME (se existir)"
+    "$MANAGER" remove_pkg "$NAME" || true
+    cmd_build "$recipe"
+}
+
+cmd_deps() {
+    local recipe="$1"
+    source "$recipe"
+    log "Resolvendo dependências para $NAME..."
+    if [ -n "${DEPENDS:-}" ]; then
+        for dep in $DEPENDS; do
+            if ! grep -q "^$dep" "$LOGDB"/installed 2>/dev/null; then
+                log "Dependência faltando: $dep"
+                # No futuro: buscar receita e chamar build automático
+            fi
+        done
+    fi
+}
+
+# ----------- Dispatcher ----------
+case "${1:-}" in
+    build) shift; cmd_build "$@" ;;
+    remove) shift; cmd_remove "$@" ;;
+    sync) shift; cmd_sync "$@" ;;
+    list) cmd_list ;;
+    info) shift; cmd_info "$@" ;;
+    upgrade) shift; cmd_upgrade "$@" ;;
+    deps) shift; cmd_deps "$@" ;;
+    help|-h|--help) help ;;
+    *) help ;;
+esac

@@ -90,6 +90,12 @@ cmd_rebuild_world() {
 case "${1:-}" in
     rebuild) cmd_rebuild_world ;;
     # ... os outros comandos permanecem iguais ...
+    install)
+    shift
+    [ -z "${1:-}" ] && err "Informe a receita"
+    log "Instalando pacote com resolução de dependências: $1"
+    prepare "$1"        # Baixa e extrai fontes + aplica patches
+    install_pkg "$1"    # Instala com dependências recursivas ;;
     help|-h|--help)
         cat <<EOF
 ${C_GREEN}opkg - Gerenciador de Pacotes Minimalista${C_RESET}

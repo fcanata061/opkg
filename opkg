@@ -1,122 +1,152 @@
 #!/bin/bash
 set -euo pipefail
 
-BASE_DIR="$(dirname "$(realpath "$0")")"
-BUILDER="$BASE_DIR/builder.sh"
-MANAGER="$BASE_DIR/manager.sh"
+CONFIG_FILE="/etc/opkg.conf"
+[ -f "$CONFIG_FILE" ] || { echo "Configuração não encontrada em $CONFIG_FILE"; exit 1; }
+source "$CONFIG_FILE"
 
-LOGDB="/var/log/meupkg"
-PKGOUT="/tmp/packages"
+mkdir -p "$WORK" "$PKG" "$BIN" "$SOURCES" "$PKGOUT" "$LOGDB"
 
-mkdir -p "$LOGDB" "$PKGOUT"
+# ---------- Utilidades ----------
+C_RESET="\033[0m"
+C_RED="\033[31m"
+C_GREEN="\033[32m"
+C_BLUE="\033[34m"
+C_YELLOW="\033[33m"
 
-log() {
-    echo "[pkg] $*"
+log() { echo -e "${C_BLUE}[opkg]${C_RESET} $*"; }
+warn() { echo -e "${C_YELLOW}[aviso]${C_RESET} $*"; }
+err() { echo -e "${C_RED}[erro]${C_RESET} $*" >&2; exit 1; }
+
+spinner() {
+    local pid=$!
+    local spin='|/-\'
+    while kill -0 $pid 2>/dev/null; do
+        for i in {0..3}; do
+            echo -ne "\r${C_GREEN}[...]"${C_RESET}" ${spin:$i:1}"
+            sleep 0.1
+        done
+    done
+    echo -ne "\r"
 }
 
-help() {
-    cat <<EOF
-Gerenciador de pacotes simples
+# ---------- Funções principais ----------
 
-Uso:
-  $0 <comando> [opções]
-
-Comandos principais:
-  build <receita>     Prepara, compila, instala e empacota o programa
-  remove <nome>       Remove um pacote instalado e limpa registros
-  upgrade <receita>   Remove versão anterior e recompila a nova
-  deps <receita>      Resolve dependências da receita (recursivo no futuro)
-  sync <repo> <dir>   Sincroniza repositório Git (HTTPS/token suportado)
-  list                Lista pacotes instalados
-  info <nome>         Mostra metadados detalhados (.json) do pacote
-  help                Mostra esta ajuda
-
-Exemplos:
-  $0 build recipes/hello.recipe
-  $0 remove hello
-  $0 list
-  $0 info hello
-  GIT_TOKEN=seutoken $0 sync https://gitserver.com/meu-repo.git pkgs
-
-Diretórios usados:
-  Fontes baixadas:     /tmp/sources
-  Área de build:       /tmp/work
-  Área de instalação:  /tmp/pkg
-  Pacotes gerados:     /tmp/packages
-  Binários finais:     /var/bin
-  Banco de dados:      /var/log/meupkg
-
-EOF
-}
-
-cmd_build() {
+cmd_upgrade() {
     local recipe="$1"
-    log "Preparando $recipe"
-    "$BUILDER" prepare "$recipe"
-    log "Compilando $recipe"
-    "$BUILDER" build "$recipe"
-    log "Instalando $recipe"
-    "$BUILDER" install "$recipe"
-    log "Empacotando $recipe"
-    "$BUILDER" package "$recipe"
+    source "$recipe"
+    log "Atualizando $NAME -> $VERSION"
+    ./manager.sh remove_pkg "$NAME" || true
+    ./builder.sh prepare "$recipe" &
+    spinner
+    ./builder.sh build "$recipe" &
+    spinner
+    ./builder.sh install "$recipe" &
+    spinner
+    ./builder.sh package "$recipe"
 }
 
-cmd_remove() {
-    local name="$1"
-    "$MANAGER" remove_pkg "$name"
-}
-
-cmd_sync() {
-    local repo="$1"
-    local dir="$2"
-    "$MANAGER" sync_repo "$repo" "$dir"
-}
-
-cmd_list() {
-    ls "$LOGDB"/*.log 2>/dev/null | sed 's#.*/##;s/\.log//' || true
+cmd_search() {
+    local query="$1"
+    local found=0
+    for f in "$PKGOUT"/*.json; do
+        [ -f "$f" ] || continue
+        if grep -iq "$query" "$f"; then
+            local name=$(jq -r .NAME "$f")
+            local ver=$(jq -r .VERSION "$f")
+            if grep -q "$name" "$LOGDB"/installed 2>/dev/null; then
+                echo -e "${C_GREEN}$name $ver [INSTALADO]${C_RESET}"
+            else
+                echo -e "${C_YELLOW}$name $ver${C_RESET}"
+            fi
+            found=1
+        fi
+    done
+    [ $found -eq 0 ] && err "Nenhum pacote encontrado para '$query'"
 }
 
 cmd_info() {
     local name="$1"
     local json="$PKGOUT/$name-"*.json
-    if ls $json >/dev/null 2>&1; then
-        cat $json | jq .
-    else
-        log "Metadados não encontrados para $name"
-    fi
+    [ -f $json ] || err "Metadados não encontrados para $name"
+    jq . "$json"
 }
 
-cmd_upgrade() {
-    local recipe="$1"
-    source "$recipe"
-    log "Removendo versão anterior de $NAME (se existir)"
-    "$MANAGER" remove_pkg "$NAME" || true
-    cmd_build "$recipe"
-}
-
-cmd_deps() {
-    local recipe="$1"
-    source "$recipe"
-    log "Resolvendo dependências para $NAME..."
-    if [ -n "${DEPENDS:-}" ]; then
-        for dep in $DEPENDS; do
-            if ! grep -q "^$dep" "$LOGDB"/installed 2>/dev/null; then
-                log "Dependência faltando: $dep"
-                # No futuro: buscar receita e chamar build automático
-            fi
+cmd_remove_orphans() {
+    log "Removendo pacotes órfãos..."
+    for pkg in $(ls "$LOGDB"/*.json 2>/dev/null | sed 's#.*/##;s/\.json//'); do
+        local deps=$(jq -r '.DEPENDS[]?' "$LOGDB/$pkg.json")
+        for d in $deps; do
+            grep -q "$d" "$LOGDB"/installed 2>/dev/null || {
+                warn "Órfão detectado: $pkg (dependia de $d)"
+                ./manager.sh remove_pkg "$pkg"
+            }
         done
+    done
+}
+
+cmd_strip() {
+    if [ "${STRIP:-1}" -eq 1 ]; then
+        log "Executando strip em binários..."
+        find "$BIN" -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
+    else
+        warn "STRIP está desabilitado em $CONFIG_FILE"
     fi
 }
 
-# ----------- Dispatcher ----------
+cmd_sha256sum() {
+    local pkgfile="$1"
+    [ -f "$pkgfile" ] || err "Arquivo não encontrado: $pkgfile"
+    sha256sum "$pkgfile" | tee "$pkgfile.sha256"
+    log "SHA256 gerado em $pkgfile.sha256"
+}
+
+cmd_verify_sha256() {
+    local pkgfile="$1"
+    [ -f "$pkgfile" ] || err "Arquivo não encontrado: $pkgfile"
+    sha256sum -c "$pkgfile.sha256"
+}
+
+cmd_rebuild_world() {
+    log "Recompilando todo o sistema em ordem de dependências..."
+    local recipes=($(ls recipes/*.recipe))
+    # Ordenação simplificada: depende de cmd_deps no manager.sh
+    for r in "${recipes[@]}"; do
+        log "Recompilando $r"
+        cmd_upgrade "$r"
+    done
+}
+
+# ---------- Dispatcher ----------
 case "${1:-}" in
-    build) shift; cmd_build "$@" ;;
-    remove) shift; cmd_remove "$@" ;;
-    sync) shift; cmd_sync "$@" ;;
-    list) cmd_list ;;
-    info) shift; cmd_info "$@" ;;
     upgrade) shift; cmd_upgrade "$@" ;;
-    deps) shift; cmd_deps "$@" ;;
-    help|-h|--help) help ;;
-    *) help ;;
+    search) shift; cmd_search "$@" ;;
+    info) shift; cmd_info "$@" ;;
+    orphans) cmd_remove_orphans ;;
+    strip) cmd_strip ;;
+    sha256sum) shift; cmd_sha256sum "$@" ;;
+    verify) shift; cmd_verify_sha256 "$@" ;;
+    rebuild) cmd_rebuild_world ;;
+    help|-h|--help)
+        cat <<EOF
+${C_GREEN}opkg - Gerenciador de Pacotes Minimalista${C_RESET}
+
+Uso:
+  $0 <comando> [args]
+
+Comandos:
+  upgrade <receita>     Atualiza pacote para nova versão
+  search <nome>         Busca programa no repositório local
+  info <nome>           Mostra informações detalhadas do pacote
+  orphans               Remove pacotes órfãos
+  strip                 Executa strip em todos os binários (se habilitado)
+  sha256sum <pkg.tar.xz>  Gera checksum SHA256
+  verify <pkg.tar.xz>   Verifica checksum SHA256
+  rebuild               Recompila todo o sistema na ordem de dependências
+  help                  Mostra esta ajuda
+
+Configuração em: $CONFIG_FILE
+EOF
+        ;;
+    *) err "Comando inválido. Use '$0 help'" ;;
 esac

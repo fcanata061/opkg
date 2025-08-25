@@ -1,0 +1,133 @@
+==============================
+OPKG TOOLCHAIN - TUTORIAL COMPLETO
+==============================
+
+1. Objetivo
+Este tutorial ensina como configurar e usar o OPKG para instalar pacotes de toolchain (ex.: gcc-pass1, binutils-pass1) em um sistema Linux ou LFS, com múltiplos prefixos, resolvendo dependências, aplicando patches e mantendo logs centralizados.
+
+2. Estrutura de Diretórios Recomendada
+/etc/opkg.conf                # Configuração global
+/etc/opkg/hooks/               # Hooks para eventos
+/var/opkg/work/                # Diretório temporário de compilação
+/var/opkg/pkg/                 # Cache de pacotes compilados
+/var/bin/                      # Binários do sistema principal
+/var/opkg/src/                 # Fontes baixadas
+/var/opkg/log/                 # Logs de pacotes
+/mnt/lfs/tools/                # Prefixo toolchain (gcc-pass1, binutils, etc.)
+recipes/                       # Receitas (*.recipe)
+
+3. Configuração do /etc/opkg.conf
+sudo tee /etc/opkg.conf >/dev/null <<'EOF'
+# Diretórios principais
+WORK=/var/opkg/work
+PKG=/var/opkg/pkg
+BIN=/var/bin
+SRC=/var/opkg/src
+LOGDB=/var/opkg/log
+TOOLS=/mnt/lfs/tools
+
+# Flags globais
+FORCE=0
+STRIP_BINARIES=1
+
+# Repositório Git remoto
+REPO_URL=https://github.com/usuario/opkg-repo.git
+EOF
+
+4. Criação de Diretórios
+sudo mkdir -p /var/opkg/{work,pkg,src,log}
+sudo mkdir -p /var/bin
+sudo mkdir -p /mnt/lfs/tools
+sudo mkdir -p /etc/opkg/hooks/{pre-install,post-install,pre-remove,post-remove,pre-upgrade,post-upgrade}
+sudo touch /var/log/opkg.log
+sudo chown $(whoami) /var/log/opkg.log
+
+5. Criando uma Receita de Toolchain
+Exemplo: recipes/gcc-pass1.recipe
+
+NAME=gcc-pass1
+VERSION=13.2.0
+SOURCE=https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+DEPENDS=(binutils-pass1 gmp mpfr mpc)
+OPTDEPENDS=(texinfo "Para documentação")
+PATCHES="patches/fix-lto.patch"
+TOOLCHAIN=1
+PREFIX=/mnt/lfs/tools
+CONFIGURE_FLAGS="--target=x86_64-lfs-linux-gnu --prefix=$PREFIX --disable-nls --disable-shared --enable-languages=c,c++"
+BUILD="./configure $CONFIGURE_FLAGS && make -j$(nproc)"
+INSTALL="make install DESTDIR=$PKG"
+PKGDIR="gcc-13.2.0"
+
+Explicação:
+- TOOLCHAIN=1 indica instalação em prefixo separado ($TOOLS)
+- PREFIX=/mnt/lfs/tools define diretório de instalação
+- DEPENDS lista dependências que serão instaladas automaticamente
+- PATCHES aplica correções antes do build
+- CONFIGURE_FLAGS, BUILD e INSTALL definem compilação e instalação
+
+6. Instalação de Toolchain
+opkg install recipes/gcc-pass1.recipe
+
+O OPKG fará:
+1. Resolver dependências recursivas (binutils-pass1, gmp, mpfr, mpc)
+2. Baixar fontes (curl, wget ou git)
+3. Extrair arquivos (tar.xz, tar.gz)
+4. Aplicar patches (PATCHES)
+5. Compilar usando toolchain no prefixo /mnt/lfs/tools
+6. Instalar binários e gerar logs em /var/opkg/log
+
+7. Verificando Instalação
+- Listar arquivos instalados:
+cat /var/opkg/log/gcc-pass1-13.2.0.files
+
+- Mostrar informações detalhadas:
+opkg info gcc-pass1
+
+- Verificar binários:
+ls /mnt/lfs/tools/bin
+
+8. Atualizando Toolchain
+Para atualizar:
+opkg upgrade recipes/gcc-pass1.recipe
+
+O OPKG remove a versão antiga e instala a nova, mantendo logs e resolvendo dependências.
+
+9. Removendo Toolchain
+Para remover:
+opkg remove gcc-pass1
+
+Todos os arquivos listados no log serão removidos e hooks pré/pós serão executados.
+
+10. Pacotes Órfãos
+Para remover dependências que não são mais usadas:
+opkg orphans
+
+11. Sincronizando Repositório Git
+Para atualizar receitas de toolchain:
+opkg sync [repo]
+
+Se nenhuma URL for passada, usa $REPO_URL do opkg.conf
+
+12. Rebuild Completo
+Para recompilar todos os pacotes de toolchain na ordem correta:
+opkg rebuild
+
+13. Opções Globais
+--force    Sobrescrever arquivos em conflito
+--help     Mostra menu de ajuda
+
+14. Logs Centralizados
+- /var/log/opkg.log                 # Log de ações
+- /var/opkg/log/<pacote>-<versão>.log   # Informações detalhadas do pacote
+- /var/log/opkg.hooks.log           # Saída de hooks
+
+15. Dicas de Uso
+- Teste pacotes em container/VM antes de usar em sistema principal
+- Use receitas minimalistas para primeiros testes
+- Configure /etc/opkg.conf antes do primeiro uso
+- Hooks permitem integração automática de scripts customizados
+- Optdepends fornecem avisos de dependências opcionais
+
+==============================
+FIM DO TUTORIAL
+==============================

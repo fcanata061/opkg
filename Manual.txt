@@ -1,0 +1,158 @@
+========================================
+OPKG - Gerenciador de Pacotes Minimalista
+========================================
+
+1️⃣ INSTALAÇÃO DO OPKG
+
+1.1 Criação de pastas principais
+--------------------------------
+sudo mkdir -p /tmp/work
+sudo mkdir -p /tmp/pkg
+sudo mkdir -p /tmp/sources
+sudo mkdir -p /tmp/packages
+sudo mkdir -p /var/bin
+sudo mkdir -p /var/log/opkg
+sudo mkdir -p /recipes
+
+1.2 Arquivo de configuração
+---------------------------
+Crie o arquivo /etc/opkg.conf:
+
+sudo nano /etc/opkg.conf
+
+Conteúdo de exemplo:
+
+# Diretórios principais
+WORK=/tmp/work
+PKG=/tmp/pkg
+BIN=/var/bin
+SOURCES=/tmp/sources
+PKGOUT=/tmp/packages
+LOGDB=/var/log/opkg
+
+# Configurações
+STRIP=1            # 1 = strip binários, 0 = não strip
+FORCE=0            # 1 = força instalação/remoção
+GIT_USER=""
+GIT_PASS=""
+GIT_TOKEN=""
+REPO=https://gitserver.com/opkg-repo.git
+
+SPINNER_CHARS='|/-\'
+
+1.3 Copiar o script OPKG
+------------------------
+Salve o script opkg.sh em /usr/local/bin/opkg:
+
+sudo cp opkg.sh /usr/local/bin/opkg
+sudo chmod +x /usr/local/bin/opkg
+
+1.4 Criar diretório para receitas
+---------------------------------
+sudo mkdir -p /recipes
+
+------------------------------------------
+2️⃣ ÁRVORE DE DIRETÓRIOS SUGERIDA
+------------------------------------------
+/etc/opkg.conf          → Configuração global
+/recipes/               → Receitas individuais (*.recipe)
+/tmp/work/              → Área de build temporária
+/tmp/pkg/               → Área de instalação temporária
+/tmp/sources/           → Fontes baixadas
+/tmp/packages/          → Pacotes gerados (.tar.xz, .json, .meta)
+/var/bin/               → Binários instalados
+/var/log/opkg/          → Logs de instalação (.log, .files)
+
+------------------------------------------
+3️⃣ COMANDOS SUPORTADOS
+------------------------------------------
+build <receita>        → Prepara, compila, instala e empacota o pacote
+install <receita>      → Igual a build
+remove <pacote>        → Remove pacote instalado (preciso)
+upgrade <receita>      → Atualiza pacote para nova versão
+rebuild                → Recompila todo o sistema na ordem correta de dependências
+search <pacote>        → Busca programa no repositório local
+info <pacote>          → Mostra informações detalhadas do pacote
+strip                  → Executa strip em todos os binários (se habilitado)
+sha256sum <arquivo>    → Gera SHA256 de pacote
+verify <arquivo>       → Verifica SHA256 de pacote
+orphans                → Remove pacotes órfãos
+sync <repo> <dir>      → Sincroniza repositório Git (HTTPS/token)
+help                   → Mostra ajuda detalhada
+
+------------------------------------------
+4️⃣ EXEMPLOS DE USO
+------------------------------------------
+# Build e instalação de uma receita
+opkg build recipes/hello.recipe
+
+# Remover pacote
+opkg remove hello
+
+# Atualizar pacote
+opkg upgrade recipes/hello.recipe
+
+# Recompilar todo o sistema
+opkg rebuild
+
+# Buscar pacotes
+opkg search gcc
+
+# Informações detalhadas
+opkg info gcc
+
+# Executar strip em binários
+opkg strip
+
+# SHA256
+opkg sha256sum /tmp/packages/gcc-12.2.0.tar.xz
+opkg verify /tmp/packages/gcc-12.2.0.tar.xz
+
+# Remover órfãos
+opkg orphans
+
+# Sincronizar repositório
+GIT_TOKEN=xxxx opkg sync https://gitserver.com/opkg-repo.git packages
+
+------------------------------------------
+5️⃣ RECEITA COMPLETA DE EXEMPLO: GCC
+------------------------------------------
+Arquivo: recipes/gcc.recipe
+
+NAME=gcc
+VERSION=12.2.0
+SOURCE=https://ftp.gnu.org/gnu/gcc/gcc-12.2.0/gcc-12.2.0.tar.xz
+PKGDIR=gcc-12.2.0
+BUILD="./configure --prefix=$PKG && make -j$(nproc)"
+INSTALL="make install DESTDIR=$PKG"
+DEPENDS="mpfr gmp mpc isl"
+PATCHES=""             # Caminhos para patches opcionais
+EXTRA_SOURCES=""       # Links adicionais de fontes, se houver
+
+------------------------------------------
+6️⃣ CRIAÇÃO DE UMA RECEITA BÁSICA
+------------------------------------------
+1. Criar arquivo recipes/nome_do_pacote.recipe
+2. Definir variáveis obrigatórias:
+   - NAME
+   - VERSION
+   - SOURCE
+   - PKGDIR
+   - BUILD
+   - INSTALL
+3. Variáveis opcionais:
+   - DEPENDS
+   - PATCHES
+   - EXTRA_SOURCES
+4. Salvar e executar: opkg build recipes/nome_do_pacote.recipe
+
+------------------------------------------
+7️⃣ NOTAS ADICIONAIS
+------------------------------------------
+- Todos os binários compilados serão movidos para /var/bin
+- Logs de instalação e lista de arquivos instalados são armazenados em /var/log/opkg
+- Pacotes gerados ficam em /tmp/packages com .tar.xz, .meta e .json
+- Dependências são resolvidas automaticamente em rebuild, evitando erros de compilação
+- Possível habilitar/desabilitar strip e --force via /etc/opkg.conf
+- SHA256 garante integridade do pacote
+- Git sync suporta HTTPS, usuário/senha ou token OAuth
